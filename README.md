@@ -3,7 +3,7 @@
 **A physics-aware, edge-deployable Lightweight Gravitational Transformer (LGT) framework.**
 
 [![Tests](https://img.shields.io/badge/tests-75%20passed-brightgreen)](#testing)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](#installation)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 
 Gravitronics implements a novel *Gravitational Attention* mechanism where tokens attract each other based on semantic "mass" and geometric proximity — a physics-inspired inductive bias that encodes hierarchical relationships natively and provides built-in regularisation via Hawking radiation.
@@ -289,9 +289,9 @@ import numpy as np
 
 net = GravitationalConsensusNetwork(G=6.674e-3)
 
-net.add_node(GravitationalNode("node-A", mass=2.0, position=np.array([0.0, 0.0])))
-net.add_node(GravitationalNode("node-B", mass=1.5, position=np.array([1.0, 0.0])))
-net.add_node(GravitationalNode("node-C", mass=1.0, position=np.array([0.5, 1.0])))
+net.add_node(GravitationalNode("node-A", mass=2.0, position=np.array([0.0, 0.0, 0.0, 0.0])))
+net.add_node(GravitationalNode("node-B", mass=1.5, position=np.array([1.0, 0.0, 0.0, 0.0])))
+net.add_node(GravitationalNode("node-C", mass=1.0, position=np.array([0.5, 1.0, 0.0, 0.0])))
 
 result = net.compute_consensus({"action": "update_weights", "value": 42})
 print(result)
@@ -375,9 +375,9 @@ These can be logged to `.jsonl` files via `DiagnosticsLogger` and consumed by:
 
 | Variant | Params | Hidden | Heads | Layers | Seq Len | Target Hardware |
 |---------|--------|--------|-------|--------|---------|-----------------|
-| `150k` | ~150K | 128 | 4 | 4 | 256 | Raspberry Pi 4, phones |
-| `600k` | ~600K | 256 | 8 | 6 | 512 | Laptop, Jetson Nano |
-| `2m` | ~2M | 512 | 16 | 8 | 1024 | Server, swarm coordinator |
+| `150k` | ~150K | 64 | 4 | 2 | 64 | Raspberry Pi 4, phones |
+| `600k` | ~600K | 128 | 4 | 3 | 128 | Laptop, Jetson Nano |
+| `2m` | ~2M | 256 | 8 | 2 | 256 | Server, swarm coordinator |
 
 ---
 
