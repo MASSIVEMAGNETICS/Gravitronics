@@ -126,10 +126,7 @@ class GravitationalAttention(nn.Module):
         dist_sq = q_sq + k_sq.transpose(-2, -1) - 2.0 * qk
         dist_sq = dist_sq.clamp(min=0.0)              # numerical safety
 
-        # Outer product of masses — (B, 1, L, 1) * (B, 1, 1, L)
-        m_i = masses.unsqueeze(1).unsqueeze(-1)       # (B, 1, L, 1)
-        m_j = masses.unsqueeze(1).unsqueeze(-2)       # (B, 1, 1, L) — fixed: was unsqueeze(-1)
-        # Actually both need to broadcast to (B, H, L, L)
+        # Outer product of masses — broadcast to (B, H, L, L)
         m_i = masses.unsqueeze(1).unsqueeze(3)        # (B, 1, L, 1)
         m_j = masses.unsqueeze(1).unsqueeze(2)        # (B, 1, 1, L)
 

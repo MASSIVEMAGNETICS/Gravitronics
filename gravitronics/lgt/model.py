@@ -253,7 +253,7 @@ class LGT(nn.Module):
         total_bytes = sum(
             p.numel() * p.element_size() for p in self.parameters()
         )
-        return total_bytes / (1024 ** 2)
+        return total_bytes / (1024 * 1024)
 
     def enable_diagnostics(self) -> None:
         """Switch on diagnostic capture in all attention / mirror modules."""
