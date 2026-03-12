@@ -1,0 +1,51 @@
+# Gravitronics LGT Edge Deployment Configuration
+version: "1.0.0"
+
+deployment:
+  target: "edge"
+  device: "cpu"
+  quantization: "fp16"
+  trace_model: true
+
+model:
+  variant: "150k"
+  hidden_dim: 128
+  num_heads: 4
+  num_layers: 4
+  max_seq_len: 256
+  gravitational_constant: 0.006674
+  hawking_temperature: 0.1
+  bekenstein_limit: 50.0
+  curvature_scale: 1.0
+  use_hawking_radiation: true
+  use_curved_positions: true
+  use_mirror_layer: true
+
+inference:
+  batch_size: 1
+  max_new_tokens: 64
+  temperature: 1.0
+  top_k: 50
+
+diagnostics:
+  enabled: true
+  log_file: "lgt_diagnostics.jsonl"
+  mirror_layer_enabled: true
+  ledger_enabled: true
+  max_snapshots: 100
+
+consensus:
+  enabled: false
+  num_nodes: 3
+  gravitational_constant: 0.006674
+  consensus_threshold: 0.5
+
+benchmark:
+  num_runs: 100
+  batch_size: 1
+  duration_sec: 5.0
+
+safety:
+  containment_enabled: true
+  ethics_gate_enabled: true
+  max_diagnostics_divergence: 10.0
