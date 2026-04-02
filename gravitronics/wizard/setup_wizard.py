@@ -849,8 +849,8 @@ class _TrainingProgressWindow:
         )
         stop_btn.pack(pady=6)
 
-        self._stop_event = __import__("threading").Event()
-        self._thread = __import__("threading").Thread(
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
             target=self._run, args=(cfg_dict,), daemon=True
         )
         self._thread.start()

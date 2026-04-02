@@ -209,7 +209,7 @@ class CheckpointManager:
             raise FileNotFoundError(f"Checkpoint not found: '{path}'.")
         if os.path.getsize(path) == 0:
             raise ValueError(f"Checkpoint file is empty: '{path}'.")
-        payload = torch.load(path, map_location=device, weights_only=False)
+        payload = torch.load(path, map_location=device, weights_only=True)
         logger.info(
             "Checkpoint loaded from '%s' (step=%s).",
             path,

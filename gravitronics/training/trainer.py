@@ -49,6 +49,14 @@ ProgressCallback = Callable[[Dict[str, Any]], None]
 class _SyntheticDataset:
     """A minimal synthetic dataset of random token sequences.
 
+    This class serves as a placeholder data source used when no real
+    ``data_dir`` is configured in :class:`TrainingConfig`.  It generates
+    random integer token sequences on-the-fly so that the training loop can
+    run end-to-end without requiring real data.
+
+    A future release will replace this with a real tokenised-shard loader
+    once the ``data_dir`` loading path is fully implemented.
+
     Parameters
     ----------
     vocab_size:

@@ -33,6 +33,7 @@ _VALID_DEVICES = {"cpu", "cuda", "mps", "auto"}
 _VALID_PRESETS = {"basic", "advanced"}
 _VALID_SELF_TRAIN_POLICIES = {"time", "data_threshold", "metric_threshold", "disabled"}
 _VALID_EXPORT_FORMATS = {"pt", "onnx", "both"}
+_VALID_EXPORT_QUANTIZATIONS = {"fp16", "int8", "none"}
 
 
 # --------------------------------------------------------------------------- #
@@ -233,9 +234,10 @@ class TrainingConfig:
                 f"export_format must be one of {sorted(_VALID_EXPORT_FORMATS)}; "
                 f"got '{self.export_format}'."
             )
-        if self.export_quantization not in ("fp16", "int8", "none"):
+        if self.export_quantization not in _VALID_EXPORT_QUANTIZATIONS:
             errs.append(
-                f"export_quantization must be 'fp16', 'int8', or 'none'; "
+                f"export_quantization must be one of "
+                f"{sorted(_VALID_EXPORT_QUANTIZATIONS)}; "
                 f"got '{self.export_quantization}'."
             )
         if self.self_train_policy not in _VALID_SELF_TRAIN_POLICIES:
