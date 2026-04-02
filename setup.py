@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="gravitronics",
-    version="1.0.0",
+    version="1.1.0",
     description="Lightweight Gravitational Transformer (LGT) framework",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
@@ -17,6 +17,15 @@ setup(
         "pyyaml>=6.0",
         "psutil>=5.9.0",
     ],
+    extras_require={
+        "onnx": ["onnx>=1.14.0", "onnxruntime>=1.15.0"],
+        "wizard": [],  # tkinter ships with Python; no extra deps needed
+    },
+    entry_points={
+        "console_scripts": [
+            "gravitronics=gravitronics.cli:main",
+        ],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
