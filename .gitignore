@@ -47,3 +47,7 @@ dmypy.json
 
 # Profiling
 *.prof
+
+# Training artifacts
+checkpoints/
+*.pt
