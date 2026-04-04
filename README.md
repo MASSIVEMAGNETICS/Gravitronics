@@ -2,7 +2,7 @@
 
 **A physics-aware, edge-deployable Lightweight Gravitational Transformer (LGT) framework.**
 
-[![Tests](https://img.shields.io/badge/tests-75%20passed-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-120%20passed-brightgreen)](#testing)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](#installation)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 
@@ -21,17 +21,25 @@ Gravitronics implements a novel *Gravitational Attention* mechanism where tokens
    - [Curved Position Embeddings](#curved-position-embeddings)
    - [Mirror Layer & Diagnostics](#mirror-layer--diagnostics)
    - [LGT Model](#lgt-model)
-5. [Edge Deployment Kit](#edge-deployment-kit)
+5. [Windows Setup Wizard](#windows-setup-wizard)
+6. [Training Subsystem](#training-subsystem)
+   - [TrainingConfig](#trainingconfig)
+   - [Trainer — Live Training Loop](#trainer--live-training-loop)
+   - [Auto Self-Training](#auto-self-training)
+   - [Checkpoints & Resume](#checkpoints--resume)
+   - [Model Export](#model-export)
+7. [CLI Reference](#cli-reference)
+8. [Edge Deployment Kit](#edge-deployment-kit)
    - [Export Model](#export-model)
    - [VictorOS Runtime Wrapper](#victoros-runtime-wrapper)
    - [Benchmark Suite](#benchmark-suite)
    - [Gravitational Consensus](#gravitational-consensus)
    - [Config File](#config-file)
-6. [Testing](#testing)
-7. [Diagnostics Schema](#diagnostics-schema)
-8. [Model Variants](#model-variants)
-9. [Deployment Guide](#deployment-guide)
-10. [License](#license)
+9. [Testing](#testing)
+10. [Diagnostics Schema](#diagnostics-schema)
+11. [Model Variants](#model-variants)
+12. [Deployment Guide](#deployment-guide)
+13. [License](#license)
 
 ---
 
@@ -186,6 +194,293 @@ model.load_state_dict(torch.load("lgt_600k.pt"))
 
 ---
 
+## Windows Setup Wizard
+
+A production-grade multi-step graphical wizard (`tkinter`, ships with Python on Windows) for configuring and launching training jobs.
+
+### Running the wizard
+
+```bash
+# Via the CLI
+python -m gravitronics.cli wizard
+
+# Or directly
+python -m gravitronics.wizard.setup_wizard
+```
+
+### Wizard steps
+
+| Step | Description |
+|------|-------------|
+| 1. Welcome | Prerequisites check (Python version, PyTorch, CUDA, ONNX) |
+| 2. Data | Choose data directory / validation split |
+| 3. Model | Select variant (150k / 600k / 2m) and preset (basic / advanced) |
+| 4. Training params | Epochs, batch size, learning rate, device, dry-run option |
+| 5. Checkpoints & export | Checkpoint dir/frequency, export format, auto self-training |
+| 6. Summary | JSON config preview, save, dry-run, and "Start Training" |
+
+The wizard:
+- Validates all inputs before advancing each step.
+- Saves the configuration to `training_config.json` (path is configurable).
+- Offers a **dry-run** to verify the config and build the model without running the loop.
+- Opens a live progress window when you click **Start Training**.
+
+### Windows installation
+
+```powershell
+# 1. Install Python 3.9+ (tkinter is bundled)
+# 2. Install Gravitronics
+pip install torch numpy pyyaml psutil
+pip install -e .
+
+# 3. (Optional) Install ONNX support
+pip install onnx onnxruntime
+
+# 4. Launch the wizard
+python -m gravitronics.cli wizard
+```
+
+---
+
+## Training Subsystem
+
+### TrainingConfig
+
+`gravitronics.training.config.TrainingConfig` is a dataclass that holds **all** training settings and is the single source of truth shared between the wizard, CLI, and Python API.
+
+```python
+from gravitronics.training.config import TrainingConfig
+
+cfg = TrainingConfig(
+    model_variant="150k",
+    epochs=20,
+    batch_size=32,
+    learning_rate=3e-4,
+    device="auto",           # auto-selects CUDA > MPS > CPU
+    checkpoint_dir="checkpoints",
+    export_dir="exports",
+    export_format="pt",
+    seed=42,
+)
+
+# Save / load
+cfg.save("training_config.json")
+cfg2 = TrainingConfig.load("training_config.json")
+```
+
+Key fields:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `model_variant` | `"150k"` | LGT size — `"150k"`, `"600k"`, or `"2m"` |
+| `epochs` | `10` | Full passes over training data |
+| `max_steps` | `0` | Hard step cap (0 = use epochs only) |
+| `batch_size` | `32` | Samples per gradient step |
+| `learning_rate` | `3e-4` | AdamW initial LR |
+| `device` | `"auto"` | `"cpu"` / `"cuda"` / `"mps"` / `"auto"` |
+| `seed` | `42` | Deterministic seed (`-1` = non-deterministic) |
+| `checkpoint_dir` | `"checkpoints"` | Checkpoint output dir |
+| `checkpoint_every_steps` | `500` | Step-based checkpoint frequency |
+| `checkpoint_every_epochs` | `1` | Epoch-based checkpoint frequency |
+| `keep_last_n_checkpoints` | `3` | Retention limit for periodic checkpoints |
+| `save_best_checkpoint` | `True` | Maintain `best_model.pt` |
+| `export_dir` | `"exports"` | Export output dir |
+| `export_format` | `"pt"` | `"pt"` / `"onnx"` / `"both"` |
+| `export_quantization` | `"fp16"` | `"fp16"` / `"int8"` / `"none"` |
+| `auto_self_train` | `False` | Enable periodic self-training |
+| `self_train_policy` | `"time"` | Trigger policy (see below) |
+| `max_wall_clock_sec` | `0.0` | Safety guard — wall-clock limit (0 = none) |
+| `early_stop_patience` | `0` | Epochs without improvement before stopping (0 = none) |
+
+### Trainer — Live Training Loop
+
+```python
+from gravitronics.training.config import TrainingConfig
+from gravitronics.training.trainer import Trainer
+import threading
+
+cfg = TrainingConfig(model_variant="150k", epochs=10, max_steps=1000)
+stop_event = threading.Event()
+
+def on_progress(info):
+    print(f"Step {info['step']} | Loss {info['loss']:.4f} | ETA {info['eta_sec']:.0f}s")
+
+trainer = Trainer(cfg, progress_callback=on_progress, stop_event=stop_event)
+result = trainer.train()
+# {"status": "ok", "steps": 1000, "epochs": 10, "final_loss": 0.312}
+
+# To stop from another thread:
+stop_event.set()
+```
+
+Features:
+- **Progress callback** — called every step with `step`, `epoch`, `loss`, `eta_sec`, `progress`.
+- **Deterministic seeding** via `TrainingConfig.seed`.
+- **Device selection** — auto-selects best available (CUDA > MPS > CPU).
+- **Gradient clipping** via `TrainingConfig.grad_clip`.
+- **Early stopping** — `early_stop_patience` epochs without validation improvement.
+- **Wall-clock guard** — `max_wall_clock_sec` aborts runaway training.
+
+### Auto Self-Training
+
+When `auto_self_train=True` the trainer enters a second loop that periodically re-trains (fine-tunes) the model on the same (or grown) dataset.
+
+**Trigger policies** (`self_train_policy`):
+
+| Policy | Trigger condition |
+|--------|-------------------|
+| `"time"` | Every `self_train_interval_sec` seconds of wall-clock time |
+| `"data_threshold"` | When the dataset has grown by ≥ `self_train_data_threshold` new samples |
+| `"metric_threshold"` | When validation loss drifts > `self_train_metric_threshold` above best |
+| `"disabled"` | Self-training is disabled |
+
+Safety guards:
+- `self_train_max_rounds` — maximum number of self-training rounds (0 = unlimited).
+- `max_wall_clock_sec` — global wall-clock cap applies across all rounds.
+- The global `stop_event` terminates self-training immediately.
+
+```python
+cfg = TrainingConfig(
+    auto_self_train=True,
+    self_train_policy="time",
+    self_train_interval_sec=3600,   # retrain every hour
+    self_train_max_rounds=5,        # at most 5 fine-tuning rounds
+    max_wall_clock_sec=86400,       # hard stop after 24 h
+)
+trainer = Trainer(cfg)
+trainer.train()
+```
+
+### Checkpoints & Resume
+
+```python
+from gravitronics.training.checkpoint import CheckpointManager
+import torch
+
+ckpt = CheckpointManager(
+    checkpoint_dir="checkpoints",
+    keep_last_n=3,       # retain 3 most-recent periodic checkpoints
+    save_best=True,      # also keep best_model.pt
+)
+
+# Save a checkpoint manually
+ckpt.save(model, optimizer, step=500, epoch=2, loss=0.85)
+
+# Save best-model checkpoint (only saved when val_loss improves)
+ckpt.save_best(model, optimizer, step=500, epoch=2, val_loss=0.72)
+
+# List / locate
+latest = ckpt.latest_checkpoint()   # → "checkpoints/checkpoint_step_00000500.pt"
+best   = ckpt.best_checkpoint()     # → "checkpoints/best_model.pt"
+
+# Verify integrity
+CheckpointManager.verify(latest)    # → True / False
+
+# Load payload dict (includes model_state_dict, optimizer_state_dict, step, …)
+payload = CheckpointManager.load(latest)
+
+# Resume training
+trainer = Trainer(cfg)
+result = trainer.train(resume_from=latest)
+```
+
+**CLI resume:**
+```bash
+python -m gravitronics.cli resume \
+    --config training_config.json \
+    --checkpoint checkpoints/checkpoint_step_00001000.pt
+```
+
+Checkpoint file format (PyTorch pickle):
+```python
+{
+  "model_state_dict": {...},
+  "optimizer_state_dict": {...},
+  "step": 1000,
+  "epoch": 5,
+  "loss": 0.72,
+  "timestamp": "2026-04-02T14:00:00",
+}
+```
+
+### Model Export
+
+```python
+from gravitronics.training.export import export_trained_model, load_exported_model
+from gravitronics.lgt.model import create_lgt
+from gravitronics.training.config import TrainingConfig
+
+model = create_lgt("150k")
+cfg = TrainingConfig(export_dir="exports", export_format="pt", export_quantization="fp16")
+
+result = export_trained_model(model, cfg, step=1000, epoch=5, val_loss=0.72)
+# result["files"] → ["exports/model.pt", "exports/model_config.json"]
+
+# Load back for inference
+loaded = load_exported_model("exports", device="cpu")
+loaded.eval()
+with torch.no_grad():
+    logits, _ = loaded(input_ids)
+```
+
+Export outputs:
+| File | Description |
+|------|-------------|
+| `model.pt` | Model state dict (or TorchScript if `trace=True`) |
+| `model.onnx` | ONNX graph (when `export_format` is `"onnx"` or `"both"`) |
+| `model_config.json` | LGTConfig sidecar for re-loading |
+| `export_metadata.json` | Export run metadata (step, epoch, val_loss, timestamp) |
+
+**CLI export:**
+```bash
+python -m gravitronics.cli export \
+    --config training_config.json \
+    --checkpoint checkpoints/best_model.pt
+```
+
+---
+
+## CLI Reference
+
+```
+gravitronics COMMAND [OPTIONS]
+
+Commands:
+  wizard           Launch the Windows graphical setup wizard
+  train            Run training from a config file
+  resume           Resume training from a checkpoint
+  export           Export a model to disk
+  validate-config  Validate a training config file
+```
+
+### Examples
+
+```bash
+# Launch the wizard
+python -m gravitronics.cli wizard
+
+# Validate a config (no training)
+python -m gravitronics.cli validate-config --config training_config.json
+
+# Train from config
+python -m gravitronics.cli train --config training_config.json
+
+# Dry run (build model, skip loop)
+python -m gravitronics.cli train --config training_config.json --dry-run
+
+# Resume
+python -m gravitronics.cli resume \
+    --config training_config.json \
+    --checkpoint checkpoints/checkpoint_step_00001000.pt
+
+# Export
+python -m gravitronics.cli export \
+    --config training_config.json \
+    --checkpoint checkpoints/best_model.pt
+```
+
+---
+
 ## Edge Deployment Kit
 
 ### Export Model
@@ -336,15 +631,17 @@ pytest tests/ -v
 pytest tests/test_lgt_model.py -v
 pytest tests/test_edge.py -v
 pytest tests/test_consensus.py -v
+pytest tests/test_training.py -v
 ```
 
-**75 tests, 0 failures.**
+**120 tests, 0 failures.**
 
 | Test file | Coverage |
 |-----------|----------|
 | `test_lgt_model.py` | Config, forward pass, diagnostics, save/load |
 | `test_edge.py` | Export, tracing, benchmarks, VictorOS wrapper |
 | `test_consensus.py` | Node creation, force law, voting, topology |
+| `test_training.py` | TrainingConfig validation/serialisation, CheckpointManager save/load/prune/best, Trainer dry-run + smoke test, export round-trip |
 
 ---
 
