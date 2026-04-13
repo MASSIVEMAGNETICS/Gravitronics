@@ -568,7 +568,8 @@ class TestCodeDataset:
         src = _make_source_dir(tmp_path)
         ds_full = CodeDataset(sources=[src], seq_len=64, stride=64)
         ds_half = CodeDataset(sources=[src], seq_len=64, stride=32)
-        assert len(ds_half) >= len(ds_full)
+        # stride=32 (half of seq_len=64) should produce roughly 2x more examples
+        assert len(ds_half) >= len(ds_full) * 1.5
 
     def test_single_file_source(self, tmp_path: Path) -> None:
         src = _make_source_dir(tmp_path)
