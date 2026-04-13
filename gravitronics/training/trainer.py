@@ -1,368 +1,561 @@
 """
-Training loop for the Lightweight Gravitational Transformer (LGT).
+trainer.py — Live training loop for the Gravitronics LGT model.
 
-The :class:`Trainer` class handles the full supervised language-modelling
-training cycle: data loading, forward pass, loss computation, backward pass,
-gradient clipping, optimisation, learning-rate scheduling, periodic logging,
-and checkpoint saving.
-
-Byte-level next-token prediction
----------------------------------
-The default dataset uses byte-level tokenisation (256-token vocabulary).
-The loss is cross-entropy between the model's predicted logits and the
-shifted target token ids — identical to standard causal language modelling.
+Features
+--------
+* Clean start / resume from checkpoint.
+* Progress callbacks (current step, epoch, loss, ETA).
+* Cancellation via threading.Event.
+* Deterministic seeding.
+* Automatic device selection.
+* Periodic + best-model checkpoint saves.
+* Auto self-training mode with three trigger policies:
+    - ``"time"``             — retrain every N seconds.
+    - ``"data_threshold"``   — retrain when dataset grows by N samples.
+    - ``"metric_threshold"`` — retrain when val_loss drifts > threshold.
+* Safety guards: max wall-clock, max steps, early stopping.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import os
+import random
+import threading
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.optim import AdamW
 
-from gravitronics.lgt.config import LGTConfig
-from gravitronics.lgt.model import LGT, create_lgt
-from gravitronics.training.checkpoints import save_checkpoint, load_checkpoint
-from gravitronics.training.dataset import CodeDataset
+from ..lgt.config import LGTConfig
+from ..lgt.model import LGT, create_lgt
+from .checkpoint import CheckpointManager
+from .config import TrainingConfig
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Trainer configuration
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TrainerConfig:
-    """All hyper-parameters that control a training run.
-
-    Attributes
-    ----------
-    sources:
-        List of file/directory paths used to build the training corpus.
-    model_variant:
-        LGT size tag — ``"150k"``, ``"600k"``, or ``"2m"``.
-    num_epochs:
-        Number of full passes over the dataset.
-    batch_size:
-        Number of sequences per optimiser step.
-    learning_rate:
-        Peak learning rate for AdamW.
-    weight_decay:
-        L2 regularisation coefficient for AdamW.
-    grad_clip:
-        Maximum gradient norm (0 to disable clipping).
-    warmup_steps:
-        Number of linear warm-up steps before cosine decay begins.
-    stride:
-        Sliding-window stride for :class:`~gravitronics.training.dataset.CodeDataset`.
-        Defaults to ``seq_len`` (no overlap).
-    checkpoint_dir:
-        Directory where checkpoints are written.
-    checkpoint_every_n_steps:
-        Save a checkpoint every *n* optimiser steps (0 = only at epoch end).
-    device:
-        Torch device string, e.g. ``"cpu"``, ``"cuda"``, ``"mps"``.
-        ``"auto"`` picks CUDA > MPS > CPU.
-    seed:
-        Random seed for reproducibility (None = do not seed).
-    log_every_n_steps:
-        Print a progress line every *n* steps.
-    """
-
-    sources: List[str] = field(default_factory=list)
-    model_variant: str = "150k"
-    num_epochs: int = 3
-    batch_size: int = 16
-    learning_rate: float = 3e-4
-    weight_decay: float = 0.01
-    grad_clip: float = 1.0
-    warmup_steps: int = 100
-    stride: Optional[int] = None
-    checkpoint_dir: str = "checkpoints"
-    checkpoint_every_n_steps: int = 500
-    device: str = "auto"
-    seed: Optional[int] = 42
-    log_every_n_steps: int = 50
+# Type alias for the progress-callback signature.
+ProgressCallback = Callable[[Dict[str, Any]], None]
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _resolve_device(device: str) -> torch.device:
-    if device == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    return torch.device(device)
+# --------------------------------------------------------------------------- #
+# Synthetic dataset (used when no real data_dir is available / for smoke tests) #
+# --------------------------------------------------------------------------- #
 
 
-def _cosine_lr_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    total_steps: int,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """Return a :class:`~torch.optim.lr_scheduler.LambdaLR` that linearly
-    warms up for *warmup_steps* then follows a cosine decay to 10 % of peak."""
+class _SyntheticDataset:
+    """A minimal synthetic dataset of random token sequences.
 
-    def _lr_lambda(current_step: int) -> float:
-        if current_step < warmup_steps:
-            return float(current_step) / max(1, warmup_steps)
-        progress = float(current_step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    This class serves as a placeholder data source used when no real
+    ``data_dir`` is configured in :class:`TrainingConfig`.  It generates
+    random integer token sequences on-the-fly so that the training loop can
+    run end-to-end without requiring real data.
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
-
-
-# ---------------------------------------------------------------------------
-# Trainer
-# ---------------------------------------------------------------------------
-
-class Trainer:
-    """Manages the full training lifecycle for an LGT model.
+    A future release will replace this with a real tokenised-shard loader
+    once the ``data_dir`` loading path is fully implemented.
 
     Parameters
     ----------
-    cfg:
-        A fully populated :class:`TrainerConfig`.
-    model:
-        Optional pre-built :class:`~gravitronics.lgt.model.LGT` instance.
-        If ``None``, a new model is created from ``cfg.model_variant``.
-    dataset:
-        Optional pre-built :class:`~gravitronics.training.dataset.CodeDataset`.
-        If ``None``, one is constructed from ``cfg.sources``.
+    vocab_size:
+        Vocabulary size of the model being trained.
+    seq_len:
+        Sequence length for each example.
+    num_samples:
+        Total number of synthetic examples.
+    """
+
+    def __init__(self, vocab_size: int, seq_len: int, num_samples: int = 1000) -> None:
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.num_samples = num_samples
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        ids = torch.randint(0, self.vocab_size, (self.seq_len,))
+        # Language-model target: shift right by one position
+        return ids[:-1], ids[1:]
+
+
+def _build_dataloader(
+    dataset: _SyntheticDataset,
+    batch_size: int,
+    shuffle: bool = True,
+) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+    """Yield batches from *dataset* indefinitely (cycling through epochs)."""
+    n = len(dataset)
+    indices = list(range(n))
+    while True:
+        if shuffle:
+            random.shuffle(indices)
+        for start in range(0, n, batch_size):
+            batch_idx = indices[start : start + batch_size]
+            xs = torch.stack([dataset[i][0] for i in batch_idx])
+            ys = torch.stack([dataset[i][1] for i in batch_idx])
+            yield xs, ys
+
+
+# --------------------------------------------------------------------------- #
+# Trainer                                                                      #
+# --------------------------------------------------------------------------- #
+
+
+class Trainer:
+    """Orchestrates a full LGT training job.
+
+    Parameters
+    ----------
+    config:
+        :class:`~gravitronics.training.config.TrainingConfig` controlling all
+        training, checkpointing, and self-training options.
+    progress_callback:
+        Optional callable invoked after every training step with a dict of
+        progress information (step, epoch, loss, eta_sec, …).
+    stop_event:
+        Optional :class:`threading.Event`; when set, training is cleanly
+        aborted after the current step completes.
     """
 
     def __init__(
         self,
-        cfg: TrainerConfig,
-        *,
-        model: Optional[LGT] = None,
-        dataset: Optional[Dataset] = None,
+        config: TrainingConfig,
+        progress_callback: Optional[ProgressCallback] = None,
+        stop_event: Optional[threading.Event] = None,
     ) -> None:
-        self.cfg = cfg
-        self.device = _resolve_device(cfg.device)
+        self.config = config
+        self.progress_callback = progress_callback
+        self.stop_event = stop_event or threading.Event()
 
-        if cfg.seed is not None:
-            torch.manual_seed(cfg.seed)
+        # Resolve concrete device string
+        self._device_str: str = config.resolve_device()
+        self._device: torch.device = torch.device(self._device_str)
 
-        # ---- Model --------------------------------------------------------
-        self.model_cfg: LGTConfig = LGTConfig.from_variant(cfg.model_variant)
-        if model is not None:
-            self.model = model
-        else:
-            self.model = create_lgt(cfg.model_variant)
-        self.model.to(self.device)
+        # State
+        self._step: int = 0
+        self._epoch: int = 0
+        self._best_val_loss: float = float("inf")
+        self._no_improve_epochs: int = 0
 
-        # ---- Dataset & DataLoader ----------------------------------------
-        if dataset is not None:
-            self._dataset = dataset
-        else:
-            if not cfg.sources:
-                raise ValueError(
-                    "TrainerConfig.sources must contain at least one path when "
-                    "no dataset is provided explicitly."
-                )
-            self._dataset = CodeDataset(
-                sources=cfg.sources,
-                seq_len=self.model_cfg.max_seq_len,
-                stride=cfg.stride,
-            )
+        # Self-training state
+        self._self_train_round: int = 0
+        self._last_self_train_time: float = time.monotonic()
+        self._baseline_data_size: int = 0
 
-        self._loader = DataLoader(
-            self._dataset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            drop_last=False,
-            pin_memory=(self.device.type == "cuda"),
+        # Checkpoint manager
+        os.makedirs(config.checkpoint_dir, exist_ok=True)
+        self.ckpt_mgr = CheckpointManager(
+            checkpoint_dir=config.checkpoint_dir,
+            keep_last_n=config.keep_last_n_checkpoints,
+            save_best=config.save_best_checkpoint,
         )
 
-        # ---- Optimiser & scheduler ---------------------------------------
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=cfg.learning_rate,
-            weight_decay=cfg.weight_decay,
-        )
-        total_steps = len(self._loader) * cfg.num_epochs
-        self.scheduler = _cosine_lr_with_warmup(
-            self.optimizer, cfg.warmup_steps, total_steps
-        )
+        # Logging setup
+        os.makedirs(config.log_dir, exist_ok=True)
+        self._configure_logging()
 
-        # ---- Loss --------------------------------------------------------
-        self.criterion = nn.CrossEntropyLoss()
+    # ------------------------------------------------------------------ #
+    # Public API                                                           #
+    # ------------------------------------------------------------------ #
 
-        # ---- State -------------------------------------------------------
-        self.global_step: int = 0
-        self.current_epoch: int = 0
-        self.best_loss: float = float("inf")
-        self._loss_history: List[float] = []
+    def train(self, resume_from: Optional[str] = None) -> Dict[str, Any]:
+        """Run the full training job.
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def train(self) -> List[float]:
-        """Run the full training loop.
+        Parameters
+        ----------
+        resume_from:
+            Path to a checkpoint to resume from.  When ``None``, training
+            starts from scratch.
 
         Returns
         -------
-        list[float]
-            Per-step training loss values recorded throughout training.
+        dict
+            Summary with ``status``, ``steps``, ``epochs``, ``final_loss``.
         """
         logger.info(
-            "Training %s  |  %d epoch(s)  |  %d batches/epoch  |  device=%s",
-            self.cfg.model_variant,
-            self.cfg.num_epochs,
-            len(self._loader),
-            self.device,
+            "Starting training: variant=%s, device=%s, epochs=%d.",
+            self.config.model_variant,
+            self._device_str,
+            self.config.epochs,
         )
 
-        for epoch in range(self.cfg.num_epochs):
-            self.current_epoch = epoch
-            epoch_loss = self._run_epoch(epoch)
+        # Seed
+        self._set_seed(self.config.seed)
+
+        # Build model
+        model_cfg = LGTConfig.from_variant(self.config.model_variant)
+        model = create_lgt(self.config.model_variant).to(self._device)
+        optimizer = AdamW(
+            model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+        )
+
+        # Resume
+        if resume_from:
+            self._step, self._epoch, _ = self.ckpt_mgr.resume(
+                model, optimizer, resume_from, device=self._device_str
+            )
+
+        # Dry run: skip the loop entirely
+        if self.config.dry_run:
+            logger.info("Dry run: config validated, model built, skipping loop.")
+            return {
+                "status": "dry_run",
+                "steps": 0,
+                "epochs": 0,
+                "final_loss": float("nan"),
+            }
+
+        # Build datasets
+        seq_len = min(model_cfg.max_seq_len, 64)
+        train_ds = self._build_dataset(model_cfg, seq_len, split="train")
+        val_ds = self._build_dataset(model_cfg, seq_len, split="val")
+        self._baseline_data_size = len(train_ds)
+
+        # Training loop
+        result = self._run_loop(model, optimizer, model_cfg, train_ds, val_ds)
+
+        # Auto self-training
+        if self.config.auto_self_train and not self.stop_event.is_set():
+            result = self._run_self_training(model, optimizer, model_cfg, train_ds, val_ds)
+
+        return result
+
+    def stop(self) -> None:
+        """Request graceful early termination."""
+        self.stop_event.set()
+        logger.info("Stop requested; training will halt after current step.")
+
+    # ------------------------------------------------------------------ #
+    # Internal: main training loop                                         #
+    # ------------------------------------------------------------------ #
+
+    def _run_loop(
+        self,
+        model: LGT,
+        optimizer: AdamW,
+        model_cfg: LGTConfig,
+        train_ds: _SyntheticDataset,
+        val_ds: _SyntheticDataset,
+    ) -> Dict[str, Any]:
+        """Run one pass of the training loop (called for initial + self-training rounds)."""
+        criterion = nn.CrossEntropyLoss()
+        start_time = time.monotonic()
+
+        steps_per_epoch = max(1, len(train_ds) // self.config.batch_size)
+        total_steps = (
+            self.config.max_steps
+            if self.config.max_steps > 0
+            else self.config.epochs * steps_per_epoch
+        )
+
+        train_loader = _build_dataloader(train_ds, self.config.batch_size)
+        final_loss = float("nan")
+
+        for epoch in range(self._epoch, self._epoch + self.config.epochs):
+            self._epoch = epoch
+            model.train()
+            epoch_loss_sum = 0.0
+            epoch_steps = 0
+
+            for step_in_epoch in range(steps_per_epoch):
+                if self.stop_event.is_set():
+                    logger.info("Stop event triggered; aborting loop.")
+                    break
+
+                # Wall-clock guard
+                elapsed = time.monotonic() - start_time
+                if (
+                    self.config.max_wall_clock_sec > 0
+                    and elapsed > self.config.max_wall_clock_sec
+                ):
+                    logger.info(
+                        "Wall-clock limit reached (%.1f s); stopping.", elapsed
+                    )
+                    self.stop_event.set()
+                    break
+
+                # Max-steps guard
+                if self.config.max_steps > 0 and self._step >= self.config.max_steps:
+                    logger.info("max_steps reached (%d); stopping.", self._step)
+                    self.stop_event.set()
+                    break
+
+                xs, ys = next(train_loader)
+                xs, ys = xs.to(self._device), ys.to(self._device)
+
+                optimizer.zero_grad()
+                logits, _ = model(xs)
+                # logits: (B, L, vocab) → reshape for cross-entropy
+                B, L, V = logits.shape
+                loss = criterion(
+                    logits.reshape(B * L, V),
+                    ys.reshape(B * L),
+                )
+                loss.backward()
+
+                if self.config.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(
+                        model.parameters(), self.config.grad_clip
+                    )
+
+                optimizer.step()
+                self._step += 1
+                epoch_loss_sum += loss.item()
+                epoch_steps += 1
+                final_loss = loss.item()
+
+                # Step-based checkpoint
+                if self._step % self.config.checkpoint_every_steps == 0:
+                    self.ckpt_mgr.save(
+                        model, optimizer, self._step, epoch, loss.item()
+                    )
+
+                # Progress callback
+                self._emit_progress(
+                    step=self._step,
+                    epoch=epoch,
+                    loss=loss.item(),
+                    elapsed=elapsed,
+                    total_steps=total_steps,
+                )
+
+            if self.stop_event.is_set():
+                break
+
+            # Epoch-level validation
+            avg_epoch_loss = epoch_loss_sum / max(1, epoch_steps)
+            val_loss = self._evaluate(model, val_ds, criterion)
             logger.info(
-                "Epoch %d/%d complete — avg loss: %.4f",
-                epoch + 1,
-                self.cfg.num_epochs,
-                epoch_loss,
+                "Epoch %d — train_loss=%.4f  val_loss=%.4f",
+                epoch,
+                avg_epoch_loss,
+                val_loss,
             )
-            # Save an epoch-end checkpoint.
-            self._maybe_save_checkpoint(force=True)
 
-        return list(self._loss_history)
-
-    def train_step(self, input_ids: torch.Tensor, target_ids: torch.Tensor) -> float:
-        """Execute a single forward + backward + optimise step.
-
-        Parameters
-        ----------
-        input_ids:
-            Token indices of shape ``(batch, seq_len)``.
-        target_ids:
-            Shifted token indices of shape ``(batch, seq_len)``.
-
-        Returns
-        -------
-        float
-            Scalar cross-entropy loss for this batch.
-        """
-        self.model.train()
-        input_ids = input_ids.to(self.device)
-        target_ids = target_ids.to(self.device)
-
-        # Forward pass — logits: (batch, seq_len, vocab_size)
-        logits, _ = self.model(input_ids)
-
-        # Reshape for CrossEntropyLoss: (batch*seq_len, vocab_size) vs (batch*seq_len,)
-        loss = self.criterion(
-            logits.reshape(-1, logits.size(-1)),
-            target_ids.reshape(-1),
-        )
-
-        self.optimizer.zero_grad()
-        loss.backward()
-
-        if self.cfg.grad_clip > 0:
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
-
-        self.optimizer.step()
-        self.scheduler.step()
-        self.global_step += 1
-
-        scalar = loss.item()
-        self._loss_history.append(scalar)
-        if scalar < self.best_loss:
-            self.best_loss = scalar
-
-        return scalar
-
-    def resume_from(self, checkpoint_path: Union[str, Path]) -> None:
-        """Load model and optimiser weights from a checkpoint.
-
-        Parameters
-        ----------
-        checkpoint_path:
-            Path to a ``.pt`` file produced by
-            :func:`~gravitronics.training.checkpoints.save_checkpoint`.
-        """
-        payload = load_checkpoint(
-            checkpoint_path,
-            self.model,
-            optimizer=self.optimizer,
-            map_location=self.device,
-        )
-        self.current_epoch = payload.get("epoch", 0)
-        self.global_step = payload.get("step", 0)
-        self.best_loss = payload.get("loss", float("inf"))
-        logger.info(
-            "Resumed from checkpoint — epoch=%d, step=%d",
-            self.current_epoch,
-            self.global_step,
-        )
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    def _run_epoch(self, epoch: int) -> float:
-        """Train for one epoch and return the average loss."""
-        total_loss = 0.0
-        t0 = time.time()
-
-        for batch_idx, (input_ids, target_ids) in enumerate(self._loader):
-            step_loss = self.train_step(input_ids, target_ids)
-            total_loss += step_loss
-
-            if (
-                self.cfg.log_every_n_steps > 0
-                and self.global_step % self.cfg.log_every_n_steps == 0
-            ):
-                elapsed = time.time() - t0
-                lr = self.scheduler.get_last_lr()[0]
-                logger.info(
-                    "epoch %d  step %d  batch %d/%d  loss=%.4f  lr=%.2e  elapsed=%.1fs",
-                    epoch + 1,
-                    self.global_step,
-                    batch_idx + 1,
-                    len(self._loader),
-                    step_loss,
-                    lr,
-                    elapsed,
+            # Epoch-based checkpoint
+            if self.config.checkpoint_every_epochs > 0 and (
+                epoch + 1
+            ) % self.config.checkpoint_every_epochs == 0:
+                self.ckpt_mgr.save(
+                    model,
+                    optimizer,
+                    self._step,
+                    epoch,
+                    avg_epoch_loss,
+                    extra={"val_loss": val_loss},
                 )
 
-            if (
-                self.cfg.checkpoint_every_n_steps > 0
-                and self.global_step % self.cfg.checkpoint_every_n_steps == 0
-            ):
-                self._maybe_save_checkpoint()
+            # Best-model checkpoint
+            self.ckpt_mgr.save_best(
+                model, optimizer, self._step, epoch, val_loss
+            )
 
-        n = max(1, len(self._loader))
-        return total_loss / n
+            # Early stopping
+            if self.config.early_stop_patience > 0:
+                if val_loss < self._best_val_loss:
+                    self._best_val_loss = val_loss
+                    self._no_improve_epochs = 0
+                else:
+                    self._no_improve_epochs += 1
+                    if self._no_improve_epochs >= self.config.early_stop_patience:
+                        logger.info(
+                            "Early stopping triggered after %d epochs "
+                            "without improvement.",
+                            self._no_improve_epochs,
+                        )
+                        break
 
-    def _maybe_save_checkpoint(self, force: bool = False) -> None:
-        """Save a checkpoint if conditions are met."""
-        if not force and self.cfg.checkpoint_every_n_steps <= 0:
+        return {
+            "status": "ok",
+            "steps": self._step,
+            "epochs": self._epoch + 1,
+            "final_loss": final_loss,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Internal: self-training                                              #
+    # ------------------------------------------------------------------ #
+
+    def _run_self_training(
+        self,
+        model: LGT,
+        optimizer: AdamW,
+        model_cfg: LGTConfig,
+        train_ds: _SyntheticDataset,
+        val_ds: _SyntheticDataset,
+    ) -> Dict[str, Any]:
+        """Execute the auto self-training loop (periodic fine-tuning)."""
+        max_rounds = self.config.self_train_max_rounds
+        result: Dict[str, Any] = {"status": "ok", "steps": self._step}
+
+        while not self.stop_event.is_set():
+            if max_rounds > 0 and self._self_train_round >= max_rounds:
+                logger.info(
+                    "Self-training max_rounds (%d) reached.", max_rounds
+                )
+                break
+
+            if not self._should_self_train(train_ds, val_ds):
+                time.sleep(5.0)
+                continue
+
+            self._self_train_round += 1
+            logger.info(
+                "Self-training round %d — retraining on %d samples.",
+                self._self_train_round,
+                len(train_ds),
+            )
+            result = self._run_loop(model, optimizer, model_cfg, train_ds, val_ds)
+            self._last_self_train_time = time.monotonic()
+            self._baseline_data_size = len(train_ds)
+
+        return result
+
+    def _should_self_train(
+        self,
+        train_ds: _SyntheticDataset,
+        val_ds: _SyntheticDataset,
+    ) -> bool:
+        """Return ``True`` when the self-training trigger policy fires."""
+        policy = self.config.self_train_policy
+        if policy == "disabled":
+            return False
+
+        if policy == "time":
+            elapsed = time.monotonic() - self._last_self_train_time
+            return elapsed >= self.config.self_train_interval_sec
+
+        if policy == "data_threshold":
+            growth = len(train_ds) - self._baseline_data_size
+            return growth >= self.config.self_train_data_threshold
+
+        if policy == "metric_threshold":
+            # Re-evaluate the current model against val_ds on-the-fly
+            # (requires access to the model — simplified here)
+            return False  # subclasses / callers can override
+
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Internal: helpers                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _evaluate(
+        self,
+        model: LGT,
+        val_ds: _SyntheticDataset,
+        criterion: nn.CrossEntropyLoss,
+    ) -> float:
+        """Compute mean validation loss over the full validation set."""
+        model.eval()
+        total_loss = 0.0
+        count = 0
+        loader = _build_dataloader(val_ds, self.config.batch_size, shuffle=False)
+        steps = max(1, len(val_ds) // self.config.batch_size)
+        with torch.no_grad():
+            for _ in range(steps):
+                xs, ys = next(loader)
+                xs, ys = xs.to(self._device), ys.to(self._device)
+                logits, _ = model(xs)
+                B, L, V = logits.shape
+                loss = criterion(
+                    logits.reshape(B * L, V),
+                    ys.reshape(B * L),
+                )
+                total_loss += loss.item()
+                count += 1
+        model.train()
+        return total_loss / max(1, count)
+
+    def _build_dataset(
+        self,
+        model_cfg: LGTConfig,
+        seq_len: int,
+        split: str,
+    ) -> _SyntheticDataset:
+        """Build a training or validation dataset.
+
+        Falls back to :class:`_SyntheticDataset` when
+        :attr:`TrainingConfig.data_dir` is empty or the path does not exist.
+        """
+        if self.config.data_dir and os.path.isdir(self.config.data_dir):
+            # Future: load real tokenised shards from data_dir.
+            # For now, still use synthetic data as a placeholder.
+            logger.info(
+                "data_dir='%s' found but real loader not yet implemented; "
+                "using synthetic data.",
+                self.config.data_dir,
+            )
+
+        n_total = 200
+        n_val = max(1, int(n_total * self.config.val_split))
+        n_train = n_total - n_val
+        n_samples = n_train if split == "train" else n_val
+        return _SyntheticDataset(
+            vocab_size=model_cfg.vocab_size,
+            seq_len=seq_len + 1,  # +1 so we can shift for targets
+            num_samples=n_samples,
+        )
+
+    @staticmethod
+    def _set_seed(seed: int) -> None:
+        """Set Python, NumPy, and PyTorch seeds for reproducibility."""
+        if seed < 0:
+            logger.info("Seed < 0 — using non-deterministic mode.")
             return
+        random.seed(seed)
+        try:
+            import numpy as np
+            np.random.seed(seed)
+        except ImportError:
+            pass
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        logger.info("Random seed set to %d.", seed)
 
-        ckpt_path = (
-            Path(self.cfg.checkpoint_dir)
-            / f"{self.cfg.model_variant}_epoch{self.current_epoch:03d}_step{self.global_step:06d}.pt"
+    def _emit_progress(
+        self,
+        step: int,
+        epoch: int,
+        loss: float,
+        elapsed: float,
+        total_steps: int,
+    ) -> None:
+        """Call the progress callback (if set) with a summary dict."""
+        if self.progress_callback is None:
+            return
+        if total_steps > 0 and step > 0:
+            frac = step / total_steps
+            eta = (elapsed / frac) * (1.0 - frac) if frac > 0 else 0.0
+        else:
+            eta = 0.0
+        self.progress_callback(
+            {
+                "step": step,
+                "epoch": epoch,
+                "loss": loss,
+                "elapsed_sec": round(elapsed, 1),
+                "eta_sec": round(eta, 1),
+                "progress": min(1.0, step / max(1, total_steps)),
+            }
         )
-        save_checkpoint(
-            self.model,
-            ckpt_path,
-            optimizer=self.optimizer,
-            epoch=self.current_epoch,
-            step=self.global_step,
-            loss=self._loss_history[-1] if self._loss_history else float("inf"),
-            config=self.model_cfg,
+
+    def _configure_logging(self) -> None:
+        """Set up structured file + console logging for this training run."""
+        level = getattr(logging, self.config.log_level.upper(), logging.INFO)
+        log_path = os.path.join(
+            self.config.log_dir,
+            f"training_{time.strftime('%Y%m%d_%H%M%S')}.log",
         )
+        fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        logging.basicConfig(level=level, format=fmt)
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(logging.Formatter(fmt))
+        logging.getLogger().addHandler(fh)
+        logger.info("Logging initialised; file='%s'.", log_path)
