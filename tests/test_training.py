@@ -491,3 +491,334 @@ class TestExportTrainedModel:
 
         with pytest.raises(FileNotFoundError):
             load_exported_model(str(tmp_path / "nonexistent"))
+
+
+# ===========================================================================
+# File-based training additions
+# ===========================================================================
+# The tests below cover CodeDataset, the checkpoints helpers (checkpoints.py),
+# FileTrainer, WizardSetup, and the CLI train-files sub-command.
+# ===========================================================================
+
+from pathlib import Path
+
+from gravitronics.training.dataset import CodeDataset, _collect_files
+from gravitronics.training.checkpoints import (
+    list_checkpoints,
+    load_checkpoint,
+    save_checkpoint,
+)
+from gravitronics.training.file_trainer import FileTrainer, FileTrainerConfig
+from gravitronics.wizard.setup import RunConfig, WizardSetup, run_wizard
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _make_source_dir(tmp_path: Path, n: int = 5) -> Path:
+    """Write *n* Python files with enough bytes for seq_len=64 examples."""
+    for i in range(n):
+        content = f"# Python file {i}\n" * 30  # ~420 bytes each
+        (tmp_path / f"file_{i}.py").write_text(content)
+    return tmp_path
+
+
+def _small_dataset(tmp_path: Path) -> CodeDataset:
+    src = _make_source_dir(tmp_path)
+    return CodeDataset(sources=[src], seq_len=64)
+
+
+# ---------------------------------------------------------------------------
+# CodeDataset
+# ---------------------------------------------------------------------------
+
+
+class TestCodeDataset:
+    def test_creates_dataset_from_directory(self, tmp_path: Path) -> None:
+        src = _make_source_dir(tmp_path)
+        ds = CodeDataset(sources=[src], seq_len=64)
+        assert len(ds) > 0
+
+    def test_items_have_correct_shapes(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        inp, tgt = ds[0]
+        assert inp.shape == (64,)
+        assert tgt.shape == (64,)
+
+    def test_target_is_shifted_input(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        inp, tgt = ds[0]
+        assert torch.equal(inp[1:], tgt[:-1])
+
+    def test_token_dtype_is_long(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        inp, tgt = ds[0]
+        assert inp.dtype == torch.long
+        assert tgt.dtype == torch.long
+
+    def test_tokens_in_valid_byte_range(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        inp, _ = ds[0]
+        assert int(inp.min()) >= 0
+        assert int(inp.max()) <= 255
+
+    def test_stride_produces_more_examples(self, tmp_path: Path) -> None:
+        src = _make_source_dir(tmp_path)
+        ds_full = CodeDataset(sources=[src], seq_len=64, stride=64)
+        ds_half = CodeDataset(sources=[src], seq_len=64, stride=32)
+        # stride=32 (half of seq_len=64) should produce roughly 2x more examples
+        assert len(ds_half) >= len(ds_full) * 1.5
+
+    def test_single_file_source(self, tmp_path: Path) -> None:
+        src = _make_source_dir(tmp_path)
+        py_file = next(src.glob("*.py"))
+        ds = CodeDataset(sources=[py_file], seq_len=64)
+        assert len(ds) > 0
+
+    def test_num_tokens_property(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        assert ds.num_tokens > 0
+
+    def test_source_files_property(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        assert len(ds.source_files) == 5
+
+    def test_empty_sources_raises(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with pytest.raises(ValueError, match="No matching files"):
+            CodeDataset(sources=[empty], seq_len=64)
+
+    def test_too_small_corpus_raises(self, tmp_path: Path) -> None:
+        tiny = tmp_path / "tiny.py"
+        tiny.write_bytes(b"hi")
+        with pytest.raises(ValueError, match="[Cc]orpus"):
+            CodeDataset(sources=[tiny], seq_len=64)
+
+    def test_collect_files_skips_wrong_extension(self, tmp_path: Path) -> None:
+        (tmp_path / "keep.py").write_text("x = 1")
+        (tmp_path / "skip.exe").write_bytes(b"\x00\x01")
+        files = _collect_files([tmp_path])
+        names = [f.name for f in files]
+        assert "keep.py" in names
+        assert "skip.exe" not in names
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints helpers (checkpoints.py — distinct from checkpoint.py)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointHelpers:
+    def test_save_and_load_round_trip(self, tmp_path: Path) -> None:
+        model = create_lgt("150k")
+        ckpt_path = tmp_path / "test.pt"
+        save_checkpoint(model, ckpt_path, epoch=2, step=100, loss=1.23)
+
+        model2 = create_lgt("150k")
+        payload = load_checkpoint(ckpt_path, model2)
+
+        assert payload["epoch"] == 2
+        assert payload["step"] == 100
+        assert abs(payload["loss"] - 1.23) < 1e-6
+
+        for (name, p1), (_, p2) in zip(
+            model.named_parameters(), model2.named_parameters()
+        ):
+            assert torch.allclose(p1, p2), f"Parameter mismatch: {name}"
+
+    def test_save_creates_parent_dirs(self, tmp_path: Path) -> None:
+        model = create_lgt("150k")
+        deep = tmp_path / "a" / "b" / "c" / "ckpt.pt"
+        save_checkpoint(model, deep)
+        assert deep.exists()
+
+    def test_load_nonexistent_raises(self, tmp_path: Path) -> None:
+        model = create_lgt("150k")
+        with pytest.raises(FileNotFoundError):
+            load_checkpoint(tmp_path / "missing.pt", model)
+
+    def test_list_checkpoints_finds_pt_files(self, tmp_path: Path) -> None:
+        model = create_lgt("150k")
+        for name in ("a.pt", "b.pt", "c.pt"):
+            save_checkpoint(model, tmp_path / name)
+        ckpts = list_checkpoints(tmp_path)
+        assert len(ckpts) == 3
+        assert all(p.suffix == ".pt" for p in ckpts)
+
+    def test_list_checkpoints_empty_dir(self, tmp_path: Path) -> None:
+        assert list_checkpoints(tmp_path) == []
+
+    def test_list_checkpoints_nonexistent_dir(self, tmp_path: Path) -> None:
+        assert list_checkpoints(tmp_path / "does_not_exist") == []
+
+
+# ---------------------------------------------------------------------------
+# FileTrainer
+# ---------------------------------------------------------------------------
+
+
+class TestFileTrainer:
+    def test_creates_model_and_runs_one_step(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        cfg = FileTrainerConfig(
+            model_variant="150k",
+            num_epochs=1,
+            batch_size=4,
+            checkpoint_every_n_steps=0,
+            log_every_n_steps=0,
+            device="cpu",
+            seed=0,
+        )
+        trainer = FileTrainer(cfg, dataset=ds)
+        inp = torch.randint(0, 256, (4, 64))
+        tgt = torch.randint(0, 256, (4, 64))
+        loss = trainer.train_step(inp, tgt)
+        assert isinstance(loss, float)
+        assert loss > 0
+
+    def test_train_returns_loss_history(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        cfg = FileTrainerConfig(
+            model_variant="150k",
+            num_epochs=1,
+            batch_size=4,
+            checkpoint_every_n_steps=0,
+            log_every_n_steps=0,
+            device="cpu",
+            seed=0,
+        )
+        trainer = FileTrainer(cfg, dataset=ds)
+        history = trainer.train()
+        assert isinstance(history, list)
+        assert len(history) > 0
+
+    def test_no_sources_raises(self) -> None:
+        cfg = FileTrainerConfig(sources=[], model_variant="150k", device="cpu")
+        with pytest.raises(ValueError, match="sources"):
+            FileTrainer(cfg)
+
+    def test_global_step_increments(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        cfg = FileTrainerConfig(
+            model_variant="150k",
+            batch_size=4,
+            checkpoint_every_n_steps=0,
+            log_every_n_steps=0,
+            device="cpu",
+        )
+        trainer = FileTrainer(cfg, dataset=ds)
+        for _ in range(3):
+            trainer.train_step(
+                torch.randint(0, 256, (4, 64)),
+                torch.randint(0, 256, (4, 64)),
+            )
+        assert trainer.global_step == 3
+
+    def test_trainer_saves_checkpoint(self, tmp_path: Path) -> None:
+        ds = _small_dataset(tmp_path)
+        ckpt_dir = tmp_path / "ckpts"
+        cfg = FileTrainerConfig(
+            model_variant="150k",
+            num_epochs=1,
+            batch_size=4,
+            checkpoint_every_n_steps=0,
+            checkpoint_dir=str(ckpt_dir),
+            log_every_n_steps=0,
+            device="cpu",
+            seed=0,
+        )
+        FileTrainer(cfg, dataset=ds).train()
+        ckpts = list_checkpoints(ckpt_dir)
+        assert len(ckpts) >= 1
+
+
+# ---------------------------------------------------------------------------
+# WizardSetup (non-interactive)
+# ---------------------------------------------------------------------------
+
+
+class TestWizardSetup:
+    def test_non_interactive_uses_defaults(self) -> None:
+        cfg = run_wizard(interactive=False)
+        assert isinstance(cfg, RunConfig)
+        assert cfg.model_variant == "150k"
+        assert cfg.num_epochs == 3
+        assert cfg.batch_size == 16
+
+    def test_non_interactive_accepts_overrides(self) -> None:
+        cfg = run_wizard(
+            interactive=False,
+            sources=["/some/path"],
+            model_variant="600k",
+            num_epochs=10,
+            batch_size=32,
+            learning_rate=1e-3,
+            checkpoint_dir="/tmp/ckpts",
+            device="cpu",
+        )
+        assert cfg.sources == ["/some/path"]
+        assert cfg.model_variant == "600k"
+        assert cfg.num_epochs == 10
+        assert cfg.batch_size == 32
+        assert abs(cfg.learning_rate - 1e-3) < 1e-10
+
+    def test_invalid_variant_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown model variant"):
+            run_wizard(interactive=False, model_variant="999m")
+
+    def test_runconfig_is_dataclass(self) -> None:
+        cfg = RunConfig()
+        assert hasattr(cfg, "sources")
+        assert hasattr(cfg, "model_variant")
+
+    def test_all_variants_accepted(self) -> None:
+        for variant in ("150k", "600k", "2m"):
+            cfg = run_wizard(interactive=False, model_variant=variant)
+            assert cfg.model_variant == variant
+
+
+# ---------------------------------------------------------------------------
+# CLI — train-files sub-command parsing
+# ---------------------------------------------------------------------------
+
+
+class TestCLITrainFiles:
+    def _parse(self, argv):
+        from gravitronics.cli import _build_parser
+
+        return _build_parser().parse_args(argv)
+
+    def test_train_files_subcommand_parsed(self) -> None:
+        args = self._parse(
+            ["train-files", "--sources", "/some/dir", "--variant", "150k", "--epochs", "2"]
+        )
+        assert args.command == "train-files"
+        assert args.sources == ["/some/dir"]
+        assert args.variant == "150k"
+        assert args.epochs == 2
+
+    def test_train_files_defaults(self) -> None:
+        args = self._parse(["train-files", "--sources", "/dir"])
+        assert args.batch_size == 16
+        assert abs(args.lr - 3e-4) < 1e-10
+        assert args.checkpoint_dir == "checkpoints"
+        assert args.device == "auto"
+        assert args.seed == 42
+
+    def test_train_files_multiple_sources(self) -> None:
+        args = self._parse(["train-files", "--sources", "/dir1", "/dir2", "file.py"])
+        assert len(args.sources) == 3
+
+    def test_train_files_resume_flag(self) -> None:
+        args = self._parse(
+            ["train-files", "--sources", "/dir", "--resume", "ckpts/model.pt"]
+        )
+        assert args.resume == "ckpts/model.pt"
+
+    def test_original_train_subcommand_still_works(self) -> None:
+        args = self._parse(["train", "--config", "training_config.json"])
+        assert args.command == "train"
+        assert args.config == "training_config.json"

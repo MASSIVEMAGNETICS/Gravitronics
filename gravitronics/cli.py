@@ -5,6 +5,7 @@ Sub-commands
 ------------
 wizard          Launch the Windows graphical setup wizard.
 train           Run a training job from a config file.
+train-files     Train directly on source files/repos (no config file needed).
 resume          Resume training from a checkpoint.
 export          Export a trained model to disk.
 validate-config Validate a config file without running training.
@@ -13,6 +14,7 @@ Usage examples
 --------------
     python -m gravitronics.cli wizard
     python -m gravitronics.cli train --config training_config.json
+    python -m gravitronics.cli train-files --sources ./my_repo ./extra.py
     python -m gravitronics.cli resume --config training_config.json \\
             --checkpoint checkpoints/checkpoint_step_00001000.pt
     python -m gravitronics.cli export --config training_config.json \\
@@ -120,6 +122,33 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_train_files(args: argparse.Namespace) -> int:
+    """Train directly on source files/repos without a config file."""
+    from gravitronics.training.file_trainer import FileTrainer, FileTrainerConfig
+
+    cfg = FileTrainerConfig(
+        sources=args.sources,
+        model_variant=args.variant,
+        num_epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_every_n_steps=args.checkpoint_steps,
+        device=args.device,
+        seed=args.seed,
+        log_every_n_steps=args.log_steps,
+    )
+    trainer = FileTrainer(cfg)
+    if args.resume:
+        trainer.resume_from(args.resume)
+    losses = trainer.train()
+    if losses:
+        print(f"\n[train-files] Done. Final loss: {losses[-1]:.4f}")
+    else:
+        print("\n[train-files] Done (no steps were executed).")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # Argument parser                                                              #
 # --------------------------------------------------------------------------- #
@@ -183,6 +212,84 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config", required=True, metavar="PATH", help="Path to training_config.json."
     )
 
+    # ── train-files ── #
+    tf_p = sub.add_parser(
+        "train-files",
+        help="Train on source files/repos directly (no config file needed).",
+    )
+    tf_p.add_argument(
+        "--sources",
+        nargs="+",
+        metavar="PATH",
+        required=True,
+        help="One or more directories / files to train on.",
+    )
+    tf_p.add_argument(
+        "--variant",
+        choices=("150k", "600k", "2m"),
+        default="150k",
+        help="Model size variant (default: 150k).",
+    )
+    tf_p.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Number of training epochs (default: 3).",
+    )
+    tf_p.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        metavar="N",
+        help="Batch size (default: 16).",
+    )
+    tf_p.add_argument(
+        "--lr",
+        type=float,
+        default=3e-4,
+        metavar="LR",
+        help="Peak learning rate for AdamW (default: 3e-4).",
+    )
+    tf_p.add_argument(
+        "--checkpoint-dir",
+        default="checkpoints",
+        metavar="DIR",
+        help="Directory to write checkpoints (default: checkpoints).",
+    )
+    tf_p.add_argument(
+        "--checkpoint-steps",
+        type=int,
+        default=500,
+        metavar="N",
+        help="Save checkpoint every N steps (default: 500).",
+    )
+    tf_p.add_argument(
+        "--device",
+        default="auto",
+        help="Torch device: auto / cpu / cuda / mps (default: auto).",
+    )
+    tf_p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        metavar="N",
+        help="Random seed (default: 42).",
+    )
+    tf_p.add_argument(
+        "--log-steps",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Log progress every N steps (default: 50).",
+    )
+    tf_p.add_argument(
+        "--resume",
+        default=None,
+        metavar="CHECKPOINT",
+        help="Path to a .pt checkpoint to resume from.",
+    )
+
     return p
 
 
@@ -193,6 +300,7 @@ def _build_parser() -> argparse.ArgumentParser:
 _COMMANDS = {
     "wizard": _cmd_wizard,
     "train": _cmd_train,
+    "train-files": _cmd_train_files,
     "resume": _cmd_resume,
     "export": _cmd_export,
     "validate-config": _cmd_validate_config,
